@@ -1,6 +1,6 @@
 # Discord Webhook Drive
 
-Using Discord webhook API to store files on cloud.
+Using Discord webhook as cloud storage.
 
 This project is for educational purposes only
 
