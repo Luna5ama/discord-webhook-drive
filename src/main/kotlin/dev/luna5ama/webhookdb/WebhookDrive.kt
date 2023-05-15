@@ -11,16 +11,18 @@ import io.ktor.serialization.kotlinx.json.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.channels.toList
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.produceIn
+import kotlinx.coroutines.flow.withIndex
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
@@ -39,6 +41,7 @@ class WebhookDrive(private val access: IWebhookAccess, private val rootMessageID
         isLenient = true
         ignoreUnknownKeys = true
     }
+
     private val httpClient = HttpClient(CIO) {
         expectSuccess = true
         install(ContentNegotiation) {
@@ -88,8 +91,10 @@ class WebhookDrive(private val access: IWebhookAccess, private val rootMessageID
         }
     }
 
+    @OptIn(FlowPreview::class)
     suspend fun put(path: String, data: ByteReadChannel) {
         val removed = paths.remove(path)
+
         coroutineScope {
             removed?.forEach {
                 launch {
@@ -97,28 +102,31 @@ class WebhookDrive(private val access: IWebhookAccess, private val rootMessageID
                 }
             }
 
-            val pendingID = mutableListOf<Deferred<Long>>()
-
-            var packet: ByteReadPacket
-            while (data.readRemaining(24 * 1024 * 1024).also { packet = it }.isNotEmpty) {
-                bufferLimiter.acquire()
-                val i = pendingID.size
-                val p = packet
-
-                pendingID.add(async {
+            flow {
+                do {
+                    bufferLimiter.acquire()
+                    val packet = data.readRemaining(25 * 1024 * 1024 - 1024)
+                    if (packet.isEmpty) {
+                        bufferLimiter.release()
+                        break
+                    }
+                    emit(packet)
+                } while (true)
+            }.withIndex().map { (i, packet) ->
+                async {
                     val filePart = FormPart(
                         "file[0]",
-                        p,
+                        packet,
                         headersOf(HttpHeaders.ContentDisposition, "filename=$i")
                     )
 
                     val result = access.executeWebhook(OutgoingWebhook(content = path), filePart).id
                     bufferLimiter.release()
                     result
-                })
+                }
+            }.produceIn(this).let {
+                paths[path] = it.toList().awaitAll().toLongArray()
             }
-
-            paths[path] = pendingID.awaitAll().toLongArray()
         }
     }
 
